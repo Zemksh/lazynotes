@@ -11,7 +11,7 @@ TRANSITIONS = {
     "transcribing": {"preparing", "failed", "deleted"},
     "preparing": {"ready", "failed", "deleted"},
     "ready": {"deleted"},
-    "failed": {"deleted"},
+    "failed": {"ready", "deleted"},
     "deleted": set(),
 }
 

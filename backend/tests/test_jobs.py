@@ -1,10 +1,14 @@
+import json
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
 from app import db
-from app.tasks import cleanup, job_lock, job_path, process_job, recover_dispatch
+from app.media import ProcessingError
+from app.schemas import Notes, Section
+from app.tasks import cleanup, job_lock, job_path, process_job, recover_dispatch, resume_notes_generation
 
 TOKEN = "a" * 64
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -206,3 +210,117 @@ def test_delete_during_processing_does_not_resurrect_job(client, audio, monkeypa
     process_job.run(jid)
     assert db.get_job(jid)["state"] == "deleted"
     assert not job_path(jid).exists()
+
+
+def test_notes_failure_retains_transcript_and_inputs(client, audio, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setenv("MOCK_MODE", "false")
+    settings.cache_clear()
+    from app.schemas import Segment
+
+    monkeypatch.setattr(
+        "app.tasks.transcribe", lambda path: ([Segment(id="s00001", start=0, end=1, text="A claim")], [])
+    )
+
+    def failing_generate(*args, **kwargs):
+        raise ProcessingError("The notes could not be checked against the transcript. Please try this class again.")
+
+    monkeypatch.setattr("app.tasks.generate_notes", failing_generate)
+    jid = upload(client, audio).json()["id"]
+    process_job.run(jid)
+    assert db.get_job(jid)["state"] == "failed"
+    # Note-generation failures retain the transcript, recording and checkpoints for manual resume.
+    assert (job_path(jid) / "transcript.json").exists()
+    assert (job_path(jid) / "audio.upload").exists()
+    assert not (job_path(jid) / "result.json").exists()
+
+
+def test_resume_notes_requires_transcript(client, audio):
+    jid = str(uuid.uuid4())
+    db.create_job(jid, "resume-key", TOKEN, "Resume me")
+    with db.connection() as connection:
+        connection.execute("UPDATE jobs SET state='failed' WHERE id=?", (jid,))
+    with pytest.raises(ProcessingError):
+        resume_notes_generation.run(jid)
+
+
+def test_resume_notes_rebuilds_result_from_retained_artifacts(client, audio, monkeypatch):
+    jid = str(uuid.uuid4())
+    db.create_job(jid, "resume-key", TOKEN, "Resume me")
+    with db.connection() as connection:
+        connection.execute("UPDATE jobs SET state='failed' WHERE id=?", (jid,))
+    folder = job_path(jid)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "transcript.json").write_text(json.dumps([{"id": "s00001", "start": 0, "end": 1, "text": "A claim"}]))
+    (folder / "input.json").write_text(json.dumps({"topics": "A standalone class", "syllabus_text": ""}))
+
+    def fake_generate(segments, topics, syllabus, title, cache_dir=None):
+        return Notes(
+            title="Resumed",
+            sections=[Section(heading="An idea", body="A claim from class.", source_segment_ids=[segments[0].id])],
+        )
+
+    monkeypatch.setattr("app.tasks.generate_notes", fake_generate)
+    resume_notes_generation.run(jid)
+    assert db.get_job(jid)["state"] == "ready"
+    assert (folder / "result.json").exists()
+
+
+def test_resume_endpoint_only_failed_jobs(client, audio, monkeypatch):
+    jid = upload(client, audio).json()["id"]
+    assert client.post(f"/jobs/{jid}/resume", headers=AUTH).status_code == 409
+    dispatched = []
+
+    def fake_apply_async(**kwargs):
+        dispatched.append(kwargs)
+
+    monkeypatch.setattr("app.main.resume_notes_generation", SimpleNamespace(apply_async=fake_apply_async))
+    jid_failed = str(uuid.uuid4())
+    db.create_job(jid_failed, "resume-key-2", TOKEN, "Resume me")
+    with db.connection() as connection:
+        connection.execute("UPDATE jobs SET state='failed' WHERE id=?", (jid_failed,))
+    response = client.post(f"/jobs/{jid_failed}/resume", headers=AUTH)
+    assert response.status_code == 202
+    assert dispatched == [{"args": [jid_failed], "task_id": jid_failed, "retry": False, "connection_timeout": 3}]
+
+
+def test_internal_checks_and_pdf_context_survive_resume(client, audio, monkeypatch):
+    from app.config import settings
+    from app.schemas import Segment
+    from app.transcription import Diagnostics
+
+    monkeypatch.setenv("MOCK_MODE", "false")
+    settings.cache_clear()
+    jid = upload(client, audio).json()["id"]
+    folder = job_path(jid)
+    (folder / "syllabus.pdf").write_bytes(b"fixture")
+    monkeypatch.setattr("app.tasks.extract_syllabus", lambda path: "PDF context only")
+    monkeypatch.setattr("app.tasks.transcribe", lambda path: (
+        [Segment(id="s1", start=0, end=1, text="Diffusion does not require ATP.")],
+        [Diagnostics("s1", -2, 0, 1)],
+    ))
+    calls = []
+    def generate(segments, topics, syllabus, title, cache_dir=None):
+        calls.append(syllabus)
+        if len(calls) == 1:
+            raise ProcessingError("Temporary fixture failure")
+        return Notes(title="Diffusion", sections=[Section(heading="Diffusion",
+            bullets=["There are 99 stages."], source_segment_ids=["s1"])])
+    monkeypatch.setattr("app.tasks.generate_notes", generate)
+    process_job.run(jid)
+    assert db.get_job(jid)["state"] == "failed"
+    report = json.loads((folder / "reliability.json").read_text())
+    assert report["transcription"]["findings"]
+    assert report["faithfulness"]["status"] == "pending"
+    resume_notes_generation.run(jid)
+    assert calls == ["PDF context only", "PDF context only"]
+    assert db.get_job(jid)["state"] == "ready"
+    result = client.get(f"/jobs/{jid}/result", headers=AUTH).json()
+    assert result["duration_seconds"] == 1
+    assert "review_items" not in result["notes"]
+    assert "faithfulness" not in result and not result["warnings"]
+    assert result["notes"]["sections"][0]["source_segment_ids"] == ["s1"]
+    assert (folder / "transcript.json").exists()
+    assert json.loads((folder / "reliability.json").read_text())["faithfulness"]["findings"]
+    assert not (folder / "audio.upload").exists()

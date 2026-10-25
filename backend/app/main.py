@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from . import db
 from .config import settings
 from .schemas import Result
-from .tasks import discard_inputs, job_lock, job_path, process_job
+from .tasks import discard_inputs, job_lock, job_path, process_job, resume_notes_generation
 
 
 @asynccontextmanager
@@ -187,3 +187,12 @@ def delete_job(job_id: uuid.UUID, token: str = Depends(access_token)):
             shutil.rmtree(job_path(job["id"]), ignore_errors=True)
     except Timeout:
         pass  # Hidden immediately; active worker removes files in its finally block.
+
+
+@app.post("/jobs/{job_id}/resume", status_code=202)
+def resume_job(job_id: uuid.UUID, token: str = Depends(access_token)):
+    job = require_job(job_id, token)
+    if job["state"] != "failed":
+        raise HTTPException(409, "Only failed classes can be resumed.")
+    resume_notes_generation.apply_async(args=[str(job_id)], task_id=str(job_id), retry=False, connection_timeout=3)
+    return public_job(db.get_job(str(job_id)))

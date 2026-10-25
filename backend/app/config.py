@@ -10,14 +10,17 @@ class Settings(BaseSettings):
     storage_path: Path = Path("./data")
     redis_url: str = "redis://localhost:6379/0"
     mock_mode: bool = False
-    whisper_model: str = "small"
+    whisper_model: str = "distil-small.en"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
-    whisper_cpu_threads: int = Field(4, ge=1)
+    whisper_cpu_threads: int = Field(12, ge=1, le=128)
+    whisper_beam_size: int = Field(1, ge=1, le=5)
     model_cache_path: Path = Path("./data/models")
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "gemma3:4b"
-    ollama_timeout_seconds: int = Field(300, ge=1)
+    ollama_timeout_seconds: int = Field(900, ge=1)
+    ollama_num_predict: int = Field(2500, ge=256)
+    ollama_keep_alive: str = "30m"
     max_audio_mb: int = Field(250, ge=1)
     max_pdf_mb: int = Field(10, ge=1)
     max_duration_seconds: int = Field(10800, ge=1)

@@ -19,13 +19,13 @@ def review_diagnostics(items: list[Diagnostics]) -> list[ReviewItem]:
     """Replaceable heuristic interface, NOT calibrated correctness/confidence."""
     return [
         ReviewItem(
-            reason="Some words may be unclear. Check them against the recording.",
+            reason="Potentially unreliable speech: log probability, repetition or no-speech heuristic.",
             source_segment_ids=[item.segment_id],
             kind="heuristic",
         )
         for item in items
-        if item.avg_logprob < -1.0 or item.compression_ratio > 2.4
-    ][:200]
+        if item.avg_logprob < -1.0 or item.compression_ratio > 2.4 or item.no_speech_prob > 0.6
+    ]
 
 
 @lru_cache(maxsize=1)
@@ -49,7 +49,10 @@ def whisper_model():
 def transcribe(path: Path) -> tuple[list[Segment], list[Diagnostics]]:
     # faster-whisper restores original time offsets after Silero VAD filtering.
     chunks, _ = whisper_model().transcribe(
-        str(path), vad_filter=True, beam_size=5, condition_on_previous_text=False
+        str(path),
+        vad_filter=True,
+        beam_size=settings().whisper_beam_size,
+        condition_on_previous_text=False,
     )
     segments, diagnostics = [], []
     for raw in chunks:

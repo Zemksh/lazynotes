@@ -6,7 +6,7 @@
     "version": "0.1.0",
     "orientation": "default",
     "userInterfaceStyle": "light",
-    "plugins": ["expo-router", "expo-sqlite", "expo-document-picker", ["expo-audio", {"microphonePermission": false}]],
+    "plugins": ["expo-router", "expo-sqlite", "expo-document-picker"],
     "ios": {"supportsTablet": true, "bundleIdentifier": "app.lazynotes.mobile", "infoPlist": {"NSLocalNetworkUsageDescription": "Connect to your local server to prepare class notes.", "NSAppTransportSecurity": {"NSAllowsLocalNetworking": true}}},
     "android": {"package": "app.lazynotes.mobile", "predictiveBackGestureEnabled": true, "permissions": [], "blockedPermissions": ["android.permission.RECORD_AUDIO"]},
     "experiments": {"typedRoutes": true}

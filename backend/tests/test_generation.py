@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 from pypdf import PdfWriter
 
-from app.generation import ask_notes, chunk_transcript, consolidate
+from app.generation import ask_notes, chunk_transcript, consolidate, generate_notes
 from app.media import ProcessingError, extract_syllabus
 from app.schemas import Notes, Result, Section, Segment, validate_sources
 from app.transcription import Diagnostics, review_diagnostics
@@ -71,31 +71,184 @@ def test_source_retry_can_recover(monkeypatch):
             pass
 
         def json(self):
-            return {"message": {"content": next(responses).model_dump_json()}}
+            return {"message": {"content": next(responses).model_dump_json(exclude={"title"})}}
 
     monkeypatch.setattr("app.generation.httpx.post", lambda *args, **kwargs: Response())
     notes = ask_notes({}, [Segment(id="s1", start=0, end=1, text="a claim")])
     assert notes.sections[0].source_segment_ids == ["s1"]
 
 
-def test_consolidation_preserves_all_source_references(monkeypatch):
-    captured = []
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
 
-    def combine(payload, segments, required=None):
-        captured.append((len(json.dumps(payload)), required))
-        return Notes(
-            title="Combined",
-            sections=[
-                Section(heading="Together", body="Combined notes", source_segment_ids=sorted(required))
-            ],
-        )
+    def raise_for_status(self):
+        pass
 
-    monkeypatch.setattr("app.generation.ask_notes", combine)
+    def json(self):
+        return self.payload
+
+
+def test_ask_notes_reports_schema_failure(monkeypatch, caplog):
+    monkeypatch.setattr(
+        "app.generation.httpx.post",
+        lambda *args, **kwargs: FakeResponse({"message": {"content": json.dumps({"title": "", "sections": []})}, "done_reason": "stop"}),
+    )
+    with pytest.raises(ProcessingError, match="could not be checked"):
+        ask_notes({"transcript": "untrusted"}, [])
+    assert "category=schema" in caplog.text
+
+
+def test_schema_retry_has_safe_field_details(monkeypatch, caplog):
+    calls = []
+    invalid = {"sections": [{"heading": "Private lecture", "bullets": [
+        {"text": "Private parent", "children": []}], "source_segment_ids": ["s1"]}],
+        "private arbitrary key": "Private lecture content"}
+    responses = iter([invalid, sample().model_dump(exclude={"title"})])
+
+    def post(*args, **kwargs):
+        calls.append(kwargs["json"])
+        return FakeResponse({"message": {"content": json.dumps(next(responses))}})
+
+    monkeypatch.setattr("app.generation.httpx.post", post)
+    result = ask_notes({}, [Segment(id="s1", start=0, end=1, text="a claim")])
+    assert result.sections
+    assert len(calls) == 2
+    retry = calls[1]["messages"][-1]["content"]
+    assert "children:too_short" in retry
+    assert "unknown_field:extra_forbidden" in retry
+    assert "attempt=0" in caplog.text
+    for private in ("Private", "private arbitrary key"):
+        assert private not in retry
+        assert private not in caplog.text
+
+
+def test_validation_diagnostics_are_bounded():
+    from app.generation import validation_details
+    from app.schemas import GeneratedNotes
+
+    with pytest.raises(ValidationError) as caught:
+        GeneratedNotes.model_validate({"sections": [{}] * 100})
+    assert len(validation_details(caught.value).split("; ")) == 8
+
+
+def test_ask_notes_reports_source_reference_failure(monkeypatch, caplog):
+    content = json.dumps(
+        {"sections": [{"heading": "An idea", "body": "A claim from class.", "source_segment_ids": ["s99999"]}]}
+    )
+    monkeypatch.setattr(
+        "app.generation.httpx.post",
+        lambda *args, **kwargs: FakeResponse({"message": {"content": content}, "done_reason": "stop"}),
+    )
+    with pytest.raises(ProcessingError, match="could not be checked"):
+        ask_notes({"transcript": "untrusted"}, [Segment(id="s1", start=0, end=1, text="a claim")])
+    assert "category=source_refs" in caplog.text
+
+
+def test_ask_notes_reports_truncation(monkeypatch, caplog):
+    monkeypatch.setattr(
+        "app.generation.httpx.post",
+        lambda *args, **kwargs: FakeResponse({"message": {"content": "{}"}, "done_reason": "length"}),
+    )
+    with pytest.raises(ProcessingError, match="could not be checked"):
+        ask_notes({"transcript": "untrusted"}, [])
+    assert "category=truncated" in caplog.text
+
+
+def test_ask_notes_reports_duplicate_source_references(monkeypatch, caplog):
+    content = json.dumps(
+        {"sections": [{"heading": "An idea", "body": "A claim from class.", "source_segment_ids": ["s1", "s1"]}]}
+    )
+    monkeypatch.setattr(
+        "app.generation.httpx.post",
+        lambda *args, **kwargs: FakeResponse({"message": {"content": content}, "done_reason": "stop"}),
+    )
+    with pytest.raises(ProcessingError, match="could not be checked"):
+        ask_notes({"transcript": "untrusted"}, [Segment(id="s1", start=0, end=1, text="a claim")])
+    assert "category=duplicate_refs" in caplog.text
+
+
+def test_ask_notes_rejects_reliability_inside_notes(monkeypatch, caplog):
+    content = json.dumps(
+        {
+            "sections": [{"heading": "An idea", "body": "A claim from class.", "source_segment_ids": ["s1"]}],
+            "review_items": [{"reason": "Unclear", "source_segment_ids": ["s1"], "kind": "heuristic"}],
+        }
+    )
+    monkeypatch.setattr(
+        "app.generation.httpx.post",
+        lambda *args, **kwargs: FakeResponse({"message": {"content": content}, "done_reason": "stop"}),
+    )
+    with pytest.raises(ProcessingError, match="could not be checked"):
+        ask_notes({"transcript": "untrusted"}, [Segment(id="s1", start=0, end=1, text="a claim")])
+    assert "category=schema" in caplog.text
+
+
+def test_consolidation_makes_no_model_calls_and_merges_source_ids(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Consolidation must not call the notes model")
+
+    monkeypatch.setattr("app.generation.ask_notes", forbidden)
     segments = [Segment(id=f"s{i}", start=i, end=i + 1, text="A claim") for i in range(9)]
     notes = consolidate([sample(s.id) for s in segments], segments)
+    # Identical content across overlapping chunks is deduplicated; source IDs are merged.
+    assert len(notes.sections) == 1
     assert set(notes.sections[0].source_segment_ids) == {s.id for s in segments}
-    assert len(captured) == 8
-    assert all(size < 30000 for size, _ in captured)
+
+
+def test_consolidation_preserves_distinct_content():
+    segments = [
+        Segment(id="s1", start=0, end=1, text="first"),
+        Segment(id="s2", start=1, end=2, text="second"),
+    ]
+    drafts = [
+        Notes(
+            title="Class",
+            sections=[Section(heading="One", body="First idea.", source_segment_ids=["s1"])],
+        ),
+        Notes(
+            title="Class",
+            sections=[Section(heading="Two", body="Second idea.", source_segment_ids=["s1", "s2"])],
+        ),
+    ]
+    notes = consolidate(drafts, segments)
+    assert {s.heading for s in notes.sections} == {"One", "Two"}
+    assert {s.body for s in notes.sections} == {"First idea.", "Second idea."}
+
+
+def test_generate_notes_reuses_cached_draft(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_ask(payload, segments, required=None, **kwargs):
+        calls.append(payload)
+        return Notes(
+            title="Class",
+            sections=[Section(heading="An idea", body="A claim from class.", source_segment_ids=[segments[0].id])],
+        )
+
+    monkeypatch.setattr("app.generation.ask_notes", fake_ask)
+    segments = [Segment(id="s1", start=0, end=1, text="A claim from class.")]
+    first = generate_notes(segments, "topic", "", "Class", cache_dir=tmp_path)
+    second = generate_notes(segments, "topic", "", "Class", cache_dir=tmp_path)
+    assert len(calls) == 1
+    assert first.sections == second.sections
+
+
+def test_generate_notes_invalidates_draft_cache_when_context_changes(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_ask(payload, segments, required=None, **kwargs):
+        calls.append(payload)
+        return Notes(
+            title="Class",
+            sections=[Section(heading="An idea", body="A claim from class.", source_segment_ids=[segments[0].id])],
+        )
+
+    monkeypatch.setattr("app.generation.ask_notes", fake_ask)
+    segments = [Segment(id="s1", start=0, end=1, text="A claim from class.")]
+    generate_notes(segments, "claim", "", "Class", cache_dir=tmp_path)
+    generate_notes(segments, "claim terminology", "", "Class", cache_dir=tmp_path)
+    assert len(calls) == 2
 
 
 def test_image_only_pdf_is_explained(tmp_path):

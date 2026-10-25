@@ -12,8 +12,9 @@ from . import db
 from .config import settings
 from .generation import generate_notes
 from .media import ProcessingError, decode_audio, extract_syllabus
+from .reliability import save_reliability
 from .schemas import Notes, Result, Section, Segment
-from .transcription import review_diagnostics, transcribe
+from .transcription import Diagnostics, transcribe
 
 cfg = settings()
 celery = Celery("lazynotes", broker=cfg.redis_url)
@@ -107,6 +108,8 @@ def process_job(job_id: str):
             folder = job_path(job_id)
             started = time.monotonic()
             stage = "load_input"
+            stage_started: dict[str, float] = {"load_input": started}
+            notes_phase = False
             try:
                 if job["expires_at"] <= time.time():
                     raise ProcessingError("This pending class expired. Please upload it again.")
@@ -118,51 +121,69 @@ def process_job(job_id: str):
                 data = json.loads((folder / "input.json").read_text())
                 db.transition(job_id, "transcribing")
                 stage = "decode_audio"
+                stage_started["decode_audio"] = time.monotonic()
                 duration = decode_audio(folder / "audio.upload", folder / "decoded.wav")
                 stage = "extract_syllabus"
+                stage_started["extract_syllabus"] = time.monotonic()
                 syllabus = data["syllabus_text"]
                 if (folder / "syllabus.pdf").exists():
                     syllabus = extract_syllabus(folder / "syllabus.pdf")
+                # Resume must use the same extracted context, including PDF text.
+                data["syllabus_text"] = syllabus
+                (folder / "input.json").write_text(json.dumps(data))
+                (folder / "duration.json").write_text(json.dumps(duration))
                 if job["mock"]:
                     stage = "mock_result"
+                    stage_started["mock_result"] = time.monotonic()
                     db.transition(job_id, "preparing")
                     result = mock_result(job_id, duration, job["title"])
                 else:
                     stage = "transcribe"
+                    stage_started["transcribe"] = time.monotonic()
                     transcript, diagnostics = transcribe(folder / "decoded.wav")
                     stage = "save_transcript"
+                    stage_started["save_transcript"] = time.monotonic()
                     # Keep the raw transcript distinct from notes and diagnostics.
                     (folder / "transcript.json").write_text(json.dumps([s.model_dump() for s in transcript]))
                     (folder / "diagnostics.json").write_text(json.dumps([asdict(d) for d in diagnostics]))
+                    save_reliability(folder, transcript, diagnostics)
                     db.transition(job_id, "preparing")
                     stage = "generate_notes"
-                    notes = generate_notes(transcript, data["topics"], syllabus, job["title"])
+                    stage_started["generate_notes"] = time.monotonic()
+                    notes_phase = True
+                    notes = generate_notes(transcript, data["topics"], syllabus, job["title"], cache_dir=folder / "drafts")
                     stage = "assemble_result"
-                    notes.review_items.extend(review_diagnostics(diagnostics))
+                    stage_started["assemble_result"] = time.monotonic()
+                    save_reliability(folder, transcript, diagnostics, notes)
                     result = Result(
                         job_id=job_id,
                         mock=False,
                         duration_seconds=duration,
                         notes=notes,
                         transcript=transcript,
-                        warnings=[
-                            "Unclear passages may be flagged, but not every transcription mistake can be detected."
-                        ],
                     )
-                # Revalidate after consolidation / adding heuristic flags.
+                # Revalidate after deterministic consolidation.
                 stage = "validate_result"
+                stage_started["validate_result"] = time.monotonic()
                 result = Result.model_validate_json(result.model_dump_json())
                 if db.get_job(job_id)["state"] == "deleted":
                     return
                 temp = folder / "result.tmp"
                 stage = "save_result"
+                stage_started["save_result"] = time.monotonic()
                 temp.write_text(result.model_dump_json())
                 temp.replace(folder / "result.json")
                 db.transition(job_id, "ready", result_location="result.json")
+                notes_phase = False
             except Exception as exc:
+                stage_seconds = {
+                    name: round(time.monotonic() - t0, 1)
+                    for name, t0 in sorted(stage_started.items())
+                    if name != stage
+                }
                 logger.error(
-                    "Job %s failed stage=%s elapsed_seconds=%.1f\n%s",
-                    job_id, stage, time.monotonic() - started, safe_traceback(exc),
+                    "Job %s failed stage=%s elapsed_seconds=%.1f stage_seconds=%s\n%s",
+                    job_id, stage, time.monotonic() - started, stage_seconds, safe_traceback(exc),
                 )
                 current = db.get_job(job_id)
                 if current and current["state"] not in {"deleted", "failed", "ready"}:
@@ -172,13 +193,61 @@ def process_job(job_id: str):
                         else "Processing stopped on the server. Check server setup and try this class again."
                     )
                     db.transition(job_id, "failed", error=message)
-                for name in ("result.tmp", "result.json", "transcript.json", "diagnostics.json"):
-                    (folder / name).unlink(missing_ok=True)
+                if not notes_phase:
+                    for name in ("result.tmp", "result.json", "transcript.json", "diagnostics.json"):
+                        (folder / name).unlink(missing_ok=True)
             finally:
-                discard_inputs(folder)
+                if not notes_phase:
+                    discard_inputs(folder)
                 current = db.get_job(job_id)
                 if current and current["state"] == "deleted":
                     shutil.rmtree(folder, ignore_errors=True)
+
+
+@celery.task(name="app.tasks.resume_notes_generation")
+def resume_notes_generation(job_id: str):
+    """Manually resume note generation for a failed job from retained artifacts."""
+    db.init_db()
+    with FileLock(settings().storage_path / "processing.lock"):
+        with job_lock(job_id):
+            job = db.get_job(job_id)
+            if not job or job["state"] != "failed":
+                return
+            folder = job_path(job_id)
+            transcript_path = folder / "transcript.json"
+            if not transcript_path.exists():
+                raise ProcessingError(
+                    "The transcript for this class is no longer available. Please upload the recording again."
+                )
+            transcript = [Segment.model_validate(s) for s in json.loads(transcript_path.read_text())]
+            data = json.loads((folder / "input.json").read_text())
+            notes = generate_notes(transcript, data["topics"], data["syllabus_text"], job["title"], cache_dir=folder / "drafts")
+            diagnostics_path = folder / "diagnostics.json"
+            diagnostics = (
+                [Diagnostics(**d) for d in json.loads(diagnostics_path.read_text())]
+                if diagnostics_path.exists()
+                else []
+            )
+            save_reliability(folder, transcript, diagnostics, notes)
+            duration_path = folder / "duration.json"
+            duration = json.loads(duration_path.read_text()) if duration_path.exists() else max(
+                (s.end for s in transcript), default=0.0
+            )
+            result = Result(
+                job_id=job_id,
+                mock=bool(job["mock"]),
+                duration_seconds=duration,
+                notes=notes,
+                transcript=transcript,
+            )
+            result = Result.model_validate_json(result.model_dump_json())
+            if db.get_job(job_id)["state"] == "deleted":
+                return
+            temp = folder / "result.tmp"
+            temp.write_text(result.model_dump_json())
+            temp.replace(folder / "result.json")
+            db.transition(job_id, "ready", result_location="result.json")
+            discard_inputs(folder)
 
 
 @celery.task(name="app.tasks.cleanup")

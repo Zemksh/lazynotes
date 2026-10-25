@@ -23,11 +23,6 @@ export const ui = StyleSheet.create({
   divider: { height: 1, backgroundColor: colors.border },
 });
 
-export function timestamp(seconds: number): string {
-  const s = Math.floor(seconds);
-  const h = Math.floor(s / 3600);
-  return `${h ? `${h}:` : ''}${h ? String(Math.floor(s / 60) % 60).padStart(2, '0') : Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
 export const stageLabel: Record<string, string> = {
   uploading: 'Uploading recording', queued: 'Waiting to begin', transcribing: 'Transcribing class',
   preparing: 'Preparing your notes', ready: 'Notes ready', failed: 'Needs your attention', expired: 'Server copy expired',
