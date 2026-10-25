@@ -1,0 +1,13 @@
+node_modules/
+.expo/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.egg-info/
+.env
+backend/data/
+*.sqlite*
+.DS_Store

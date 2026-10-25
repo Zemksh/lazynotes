@@ -1,0 +1,43 @@
+x-backend: &backend
+  build: ./backend
+  env_file: ./backend/.env
+  environment:
+    STORAGE_PATH: /data
+    MODEL_CACHE_PATH: /data/models
+    REDIS_URL: redis://redis:6379/0
+    OLLAMA_URL: http://host.docker.internal:11434
+  volumes:
+    - backend-data:/data
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+  api:
+    <<: *backend
+    ports:
+      - "8000:8000"
+  worker:
+    <<: *backend
+    command: celery -A app.tasks.celery worker --loglevel=WARNING --concurrency=1
+  scheduler:
+    <<: *backend
+    command: celery -A app.tasks.celery beat --loglevel=WARNING --schedule=/data/celerybeat-schedule
+
+volumes:
+  backend-data:
+  redis-data:
