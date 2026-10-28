@@ -13,8 +13,10 @@ from starlette.concurrency import run_in_threadpool
 
 from . import db
 from .config import settings
+from .insights import LectureInsights, build_insights
 from .schemas import Result
 from .tasks import discard_inputs, job_lock, job_path, process_job, resume_notes_generation
+from .transcription import Diagnostics
 
 
 @asynccontextmanager
@@ -176,6 +178,44 @@ def get_result(job_id: uuid.UUID, token: str = Depends(access_token)):
         return Result.model_validate_json((job_path(str(job_id)) / "result.json").read_text())
     except FileNotFoundError:
         raise HTTPException(410, "These notes are no longer available on the server.") from None
+
+
+@app.get("/jobs/{job_id}/insights", response_model=LectureInsights)
+def get_insights(job_id: uuid.UUID, token: str = Depends(access_token)):
+    # Isolated from generation: older retained results work without a model rerun.
+    require_job(job_id, token)
+    try:
+        with job_lock(str(job_id)).acquire(timeout=0):
+            result = get_result(job_id, token)
+            folder = job_path(str(job_id))
+            cache = folder / "insights.json"
+            if cache.exists():
+                try:
+                    return LectureInsights.model_validate_json(cache.read_text())
+                except ValueError:
+                    pass  # An outdated schema can be rebuilt from the saved result.
+            diagnostics = []
+            try:
+                raw = json.loads((folder / "diagnostics.json").read_text())
+                if isinstance(raw, list):
+                    for item in raw:
+                        try:
+                            diagnostic = Diagnostics(**item)
+                            if isinstance(diagnostic.segment_id, str) and all(isinstance(v, (int, float)) for v in (
+                                diagnostic.avg_logprob, diagnostic.no_speech_prob, diagnostic.compression_ratio
+                            )):
+                                diagnostics.append(diagnostic)
+                        except (TypeError, ValueError):
+                            continue
+            except (FileNotFoundError, ValueError):
+                pass  # Missing diagnostics are explicitly shown as unavailable.
+            insights = build_insights(result, diagnostics)
+            temp = folder / "insights.tmp"
+            temp.write_text(insights.model_dump_json())
+            temp.replace(cache)
+            return insights
+    except Timeout:
+        raise HTTPException(409, "This class is busy. Please try insights again shortly.") from None
 
 
 @app.delete("/jobs/{job_id}", status_code=204)

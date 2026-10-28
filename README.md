@@ -10,7 +10,7 @@ Turn recorded university lectures into topic-wise study notes, with clear headin
 - Generate bullet-first notes with subtopics, nested details, and comparison tables.
 - Save notes locally and edit headings, explanations, and bullets offline.
 - Recover interrupted uploads and resume failed generation using compatible chunk checkpoints.
-- Keep source references and reliability checks internal, without playback links or warnings cluttering notes.
+- Explore rule-based transcription flags and unsupervised concept groups in **Lecture Insights**, separate from Study Notes.
 
 **Workflow:** Record → Upload → Transcribe → Generate notes → Study.
 
@@ -24,6 +24,7 @@ Turn recorded university lectures into topic-wise study notes, with clear headin
 | API and background jobs | FastAPI, Celery, Redis |
 | Audio transcription | FFmpeg, faster-whisper |
 | Notes | Gemma 3:4B through Ollama; Python consolidation |
+| Lecture insights | scikit-learn TF-IDF and hierarchical clustering; Whisper diagnostic rules |
 
 Locally runnable AI keeps processing on your own backend without requiring a paid AI API. Model downloads still require internet access; model licenses apply separately.
 
@@ -107,6 +108,16 @@ celery -A app.tasks.celery beat --loglevel=WARNING --schedule=./data/celerybeat-
 ```
 
 Use the same `.env` and storage directory for all three processes. Run exactly one scheduler for cleanup and queue recovery. The template's localhost Redis/Ollama URLs apply to this setup.
+
+## Demo: Lecture Insights
+
+Open a saved class and select **Lecture Insights**. The authenticated `/jobs/{id}/insights` endpoint analyzes existing notes and diagnostics, caches the result on the server, and saves it on the phone for offline viewing. It does not rerun Whisper or Gemma; local edits do not change this analysis. Insights version 2 excludes inline transcript IDs from word features and uses unigram TF-IDF; older caches refresh when the server copy is reachable. The app shows concise results; the methodology is documented here instead.
+
+- **Heuristic, not supervised:** transcription flags use existing Whisper log-probability, repetition, and no-speech rules. No suitable human-labelled dataset or evaluated classifier is included. Counts and excerpts come from actual saved diagnostics; missing diagnostics are marked unavailable, not reliable.
+- **Unsupervised:** TF-IDF learns vocabulary from note sections, then average-link hierarchical clustering groups them by cosine distance. The group count is not fixed. A distance threshold of 0.7 controls grouping; it is not an accuracy score. Standalone sections and empty vocabulary are handled explicitly. English stopwords, lexical similarity, and the untuned threshold limit interpretation.
+- **Unchanged:** Whisper transcription, Gemma generation, source validation, internal faithfulness screening, and chunk checkpoints. No additional LLM calls or model downloads are needed for insights.
+
+To demonstrate: rebuild the backend (`docker compose up -d --build`), restart Expo, then open Insights while the server copy is still available. Open it once before presenting to cache it offline. Expired/deleted server copies cannot supply missing diagnostics; already-cached insights still work. Mock classes are explicitly labelled examples, not real recording analysis. No new environment settings are required.
 
 ## Troubleshooting
 
