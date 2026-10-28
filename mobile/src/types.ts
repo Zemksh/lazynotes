@@ -21,6 +21,19 @@ export type SavedClass = {
   edits: Record<string, SectionEdit>;
   error?: string; syncError?: string; mock?: boolean; expiresAt?: number;
   serverDeleted?: boolean;
+  insights?: LectureInsights;
+};
+export type LectureInsights = {
+  version: 1 | 2; mock: boolean;
+  transcription: {
+    method: 'rule_based'; status: 'available' | 'partial' | 'unavailable' | 'mock';
+    total_passages: number; analyzed_passages: number; flagged_passages: number; affected_sections: number;
+    passages: { text: string; reason: string; headings: string[] }[];
+  };
+  concepts: {
+    method: 'tfidf_agglomerative'; status: 'available' | 'insufficient_text'; ungrouped_sections: number;
+    groups: { terms: string[]; section_indices: number[]; headings: string[] }[];
+  };
 };
 export type RemoteJob = {
   id: string; state: Exclude<Stage, 'uploading' | 'expired'>; title: string;

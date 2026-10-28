@@ -1,4 +1,4 @@
-import { ClassResult, RemoteJob, SavedClass } from './types';
+import { ClassResult, LectureInsights, RemoteJob, SavedClass } from './types';
 
 export const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8000').replace(/\/$/, '');
 
@@ -33,6 +33,7 @@ export type Health = { mock: boolean; max_audio_mb: number; max_pdf_mb: number; 
 export const health = () => request<Health>(`${API_URL}/health`);
 export const status = (item: SavedClass) => request<RemoteJob>(`${item.apiUrl}/jobs/${item.remoteId}`, item.token);
 export const result = (item: SavedClass) => request<ClassResult>(`${item.apiUrl}/jobs/${item.remoteId}/result`, item.token);
+export const lectureInsights = (item: SavedClass) => request<LectureInsights>(`${item.apiUrl}/jobs/${item.remoteId}/insights`, item.token);
 export const deleteRemote = (item: SavedClass) => request<void>(`${item.apiUrl}/jobs/${item.remoteId}`, item.token, 'DELETE');
 
 export function upload(item: SavedClass, onProgress: (fraction: number | undefined) => void): Promise<RemoteJob> {

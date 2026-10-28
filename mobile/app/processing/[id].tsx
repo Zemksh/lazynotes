@@ -7,6 +7,7 @@ import { Button, ErrorMessage, MockNotice } from '../../src/components';
 import { removeLocalClass } from '../../src/storage';
 import { deleteRemote, ApiError } from '../../src/api';
 import { colors, stageLabel, ui } from '../../src/theme';
+import { ReconnectServer } from '../../src/ReconnectServer';
 
 const steps = ['uploading', 'queued', 'transcribing', 'preparing', 'ready'];
 
@@ -42,6 +43,7 @@ export default function Processing() {
   }
 
   return <SafeAreaView style={ui.screen} edges={['bottom', 'left', 'right']}><ScrollView contentContainerStyle={ui.content}>
+    <ReconnectServer item={item} onConnected={async () => { await refresh(); await sync(); }} />
     <Text style={ui.eyebrow}>ONE CLASS, COMING TOGETHER</Text>
     <Text style={ui.title}>{item.title}</Text>
     {item.mock && <MockNotice />}

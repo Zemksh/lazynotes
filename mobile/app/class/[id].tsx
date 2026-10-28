@@ -10,6 +10,9 @@ import { ui } from '../../src/theme';
 import { Bullet, SavedClass } from '../../src/types';
 import { BulletEditor, validBullets } from '../../src/BulletEditor';
 import { StudySection } from '../../src/StudySection';
+import { InsightTabs, LectureTab } from '../../src/InsightTabs';
+import { LectureInsightsPanel } from '../../src/LectureInsights';
+import { ReconnectServer } from '../../src/ReconnectServer';
 
 export default function ClassDetail() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -26,6 +29,7 @@ function Detail({ item }: { item: SavedClass }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const [serverBusy, setServerBusy] = useState(false);
+  const [tab, setTab] = useState<LectureTab>('notes');
 
   async function saveEdit() {
     if (!editor || saving) return;
@@ -71,7 +75,9 @@ function Detail({ item }: { item: SavedClass }) {
   return <SafeAreaView style={ui.screen} edges={['bottom', 'left', 'right']}>
     <ScrollView contentContainerStyle={ui.content}>
       {header}
-      {output.notes.sections.map((section, index) => {
+      <ReconnectServer item={item} onConnected={refresh} />
+      <InsightTabs value={tab} onChange={setTab} />
+      {tab === 'insights' ? <LectureInsightsPanel key={`${item.id}:${item.apiUrl}`} item={item} onSaved={refresh} /> : output.notes.sections.map((section, index) => {
         const edit = item.edits[String(index)];
         const previous = output.notes.sections[index - 1];
         const previousHeading = item.edits[String(index - 1)]?.heading ?? previous?.heading;
